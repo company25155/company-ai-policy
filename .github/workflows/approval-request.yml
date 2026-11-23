@@ -1,0 +1,51 @@
+# 「承認待ち」ラベルが付いたら、承認BOTに知らせて責任者へ送ってもらう
+# 送る内容は承認BOTが GitHub から読み直すため、ここでは番号だけを渡す。
+# 必要な設定（リポジトリの Settings → Secrets and variables → Actions → Secrets）
+#   APPROVAL_BOT_URL     … 承認BOTの受け口のURL
+#   APPROVAL_BOT_SECRET  … 承認BOTと共有する合言葉
+# このリポジトリは公開のため、ログにURLや相手先の名前が出ないようにしている。
+name: 承認依頼を送る
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: approval-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  send:
+    if: github.event.label.name == '承認待ち'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 承認BOTに承認依頼を送る
+        env:
+          APPROVAL_BOT_URL: ${{ secrets.APPROVAL_BOT_URL }}
+          APPROVAL_BOT_SECRET: ${{ secrets.APPROVAL_BOT_SECRET }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$APPROVAL_BOT_URL" ] || [ -z "$APPROVAL_BOT_SECRET" ]; then
+            echo "::error::APPROVAL_BOT_URL または APPROVAL_BOT_SECRET が設定されていません"
+            exit 1
+          fi
+          payload=$(jq -n --arg s "$APPROVAL_BOT_SECRET" --arg r "$REPO" --argjson n "$NUMBER" '{secret:$s, repo:$r, number:$n}')
+          # 承認BOTは応答を別のURLから返すため、-L で転送先までたどる。
+          # エラーの文に相手先の名前が出ないよう、curl のエラー表示は捨てる。
+          if ! result=$(curl -s -L --max-time 60 -H 'Content-Type: application/json' --data "$payload" "${APPROVAL_BOT_URL}?route=github" 2>/dev/null); then
+            echo "::error::承認BOTに接続できませんでした"
+            exit 1
+          fi
+          if [ "$(echo "$result" | jq -r '.ok' 2>/dev/null)" != "true" ]; then
+            echo "::error::承認依頼を送れませんでした（理由：$(echo "$result" | jq -r '.reason // "不明"' 2>/dev/null)）"
+            exit 1
+          fi
+          echo "承認依頼を送りました"
+          warning=$(echo "$result" | jq -r '.warning // empty' 2>/dev/null)
+          if [ -n "$warning" ]; then
+            echo "::warning::$warning（責任者には送信済みです。送り直さないでください）"
+          fi

@@ -1,0 +1,73 @@
+# 承認の確認：承認BOTが付けた「承認済み」ラベルがないPRは、この検査が失敗する。
+# main を守る設定（Rulesets）で、この検査「approval-check」をマージに必須の検査にする。
+# 次のどれかに当たると失敗する。
+#   - 「承認済み」ラベルが付いていない
+#   - 「承認済み」を付けたのが承認BOTではない（誰が付けたかをログに残す）
+#   - 承認の後に、変更が追加・上書きされた
+# 必要な設定（Settings → Secrets and variables → Actions → Variables）
+#   APPROVAL_BOT_LOGIN  … 承認BOTのアカウント名（例：xxxx[bot]）
+# 外部の部品は使わない（GitHub が用意した gh と jq だけを使う）。
+name: 承認の確認
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  approval-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 承認BOTの「承認済み」ラベルを確かめる
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BOT: ${{ vars.APPROVAL_BOT_LOGIN }}
+        run: |
+          if [ -z "$BOT" ]; then
+            echo "::error::変数 APPROVAL_BOT_LOGIN が設定されていません"
+            exit 1
+          fi
+          # PRの出来事（ラベル・コミットなど）を古い順に取得する
+          gh api --paginate "repos/$REPO/issues/$NUMBER/timeline" --jq '.[]' | jq -s '.' > timeline.json
+
+          # 「承認済み」を付けた・外した記録をログに残す
+          echo "「承認済み」ラベルの記録："
+          jq -r '.[] | select((.event=="labeled" or .event=="unlabeled") and .label.name=="承認済み") | "  \(.created_at)  \(.event)  \(.actor.login)"' timeline.json
+
+          result=$(jq -r --arg bot "$BOT" '
+            . as $t
+            | ([range(0; length)] | map(select($t[.].event=="labeled" and $t[.].label.name=="承認済み" and $t[.].actor.login==$bot)) | last) as $ok
+            | ([range(0; length)] | map(select($t[.].event=="labeled" and $t[.].label.name=="承認済み" and $t[.].actor.login!=$bot)) | length) as $other
+            | if $ok == null then "none"
+              elif ([range($ok+1; length)] | map(select($t[.].event=="unlabeled" and $t[.].label.name=="承認済み")) | length) > 0 then "removed"
+              elif ([range($ok+1; length)] | map(select($t[.].event=="committed" or $t[.].event=="head_ref_force_pushed")) | length) > 0 then "changed"
+              elif $other > 0 then "ok-with-other"
+              else "ok" end
+          ' timeline.json)
+
+          case "$result" in
+            ok)
+              echo "承認BOTによる承認を確認しました" ;;
+            ok-with-other)
+              echo "::warning::承認BOT以外のアカウントが「承認済み」を付けた記録があります（承認としては扱っていません）"
+              echo "承認BOTによる承認を確認しました" ;;
+            none)
+              echo "::error::承認BOTが付けた「承認済み」ラベルがありません。「承認待ち」ラベルを付けて、責任者に承認を依頼してください"
+              exit 1 ;;
+            removed)
+              echo "::error::「承認済み」ラベルが外されています"
+              exit 1 ;;
+            changed)
+              echo "::error::承認の後に変更が追加されました。もう一度「承認待ち」を付けて承認を依頼してください"
+              exit 1 ;;
+            *)
+              echo "::error::承認の状態を確かめられませんでした"
+              exit 1 ;;
+          esac
